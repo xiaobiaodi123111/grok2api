@@ -3,6 +3,7 @@
 import base64
 import binascii
 import mimetypes
+import re
 from typing import Annotated, AsyncGenerator, AsyncIterable, Literal
 
 import orjson
@@ -34,6 +35,91 @@ _TAG_RESPONSES = "OpenAI - Responses"
 _TAG_IMAGES = "OpenAI - Images"
 _TAG_VIDEOS = "OpenAI - Videos"
 _TAG_FILES = "OpenAI - Files"
+_GROK_IMAGINE_VIDEO_MODEL = "grok-imagine-video"
+
+
+def _is_grok_imagine_video_alias(model: str | None) -> bool:
+    normalized = (model or "").strip().lower()
+    return normalized.startswith("grok-imagine-") and "-video-" in normalized
+
+
+def _grok_imagine_video_alias_resolution(model: str | None) -> str | None:
+    normalized = (model or "").strip().lower()
+    if normalized.startswith("grok-imagine-0.8-video-"):
+        return "480p"
+    if normalized.startswith("grok-imagine-1.0-video-"):
+        return "720p"
+    if _is_grok_imagine_video_alias(normalized):
+        return "720p"
+    return None
+
+
+def _grok_imagine_video_alias_seconds(model: str | None) -> int | None:
+    normalized = (model or "").strip().lower()
+    if not _is_grok_imagine_video_alias(normalized):
+        return None
+    match = re.search(r"-(\d+)s\b", normalized)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _grok_imagine_video_alias_size(model: str | None) -> str | None:
+    normalized = (model or "").strip().lower()
+    if not _is_grok_imagine_video_alias(normalized):
+        return None
+    if "landscape" in normalized:
+        return "1280x720"
+    if "portrait" in normalized:
+        return "720x1280"
+    return None
+
+
+def _normalize_video_prompt_ratio(prompt: str | None, size: str) -> str | None:
+    if not prompt:
+        return prompt
+
+    ratio = "16:9 横屏" if size == "1280x720" else "9:16 竖屏"
+    replacements = {
+        "视频比例：9:16 竖屏": f"视频比例：{ratio}",
+        "视频比例: 9:16 竖屏": f"视频比例: {ratio}",
+        "视频比例：16:9 横屏": f"视频比例：{ratio}",
+        "视频比例: 16:9 横屏": f"视频比例: {ratio}",
+    }
+    for old, new in replacements.items():
+        prompt = prompt.replace(old, new)
+    return prompt
+
+
+def _normalize_grok_video_alias_request(
+    model: str | None,
+    prompt: str | None,
+    size: str | None,
+    resolution_name: str | None,
+    seconds: str | int | None,
+    aspect_ratio: str | None = None,
+) -> tuple[str | None, str | None, str | None, str | None, str | int | None]:
+    if not _is_grok_imagine_video_alias(model):
+        return model, prompt, size, resolution_name, seconds
+
+    alias_size = _grok_imagine_video_alias_size(model)
+    if not alias_size:
+        requested_aspect = (aspect_ratio or "").strip()
+        if requested_aspect == "9:16":
+            alias_size = "720x1280"
+        elif requested_aspect == "16:9":
+            alias_size = "1280x720"
+        else:
+            requested_size = (size or "").strip().lower()
+            alias_size = "720x1280" if requested_size == "720x1280" else "1280x720"
+
+    return (
+        _GROK_IMAGINE_VIDEO_MODEL,
+        _normalize_video_prompt_ratio(prompt, alias_size),
+        alias_size,
+        _grok_imagine_video_alias_resolution(model) or resolution_name,
+        _grok_imagine_video_alias_seconds(model) or seconds,
+    )
 
 
 async def _available_pools(request: Request) -> frozenset[str]:
@@ -469,6 +555,7 @@ async def videos_create(request: Request):
     prompt: str | None = None
     seconds: str | int | None = None
     size: str | None = None
+    aspect_ratio: str | None = None
     resolution_name: str | None = None
     preset: str | None = None
     references_payload: list[dict[str, str]] | None = None
@@ -485,26 +572,48 @@ async def videos_create(request: Request):
         prompt = str(body.get("prompt") or "").strip() or None
         seconds = body.get("seconds", body.get("duration", 6))
         size = str(body.get("size") or "720x1280").strip() or "720x1280"
+        aspect_ratio = str(body.get("aspect_ratio") or body.get("aspectRatio") or "").strip() or None
         resolution_name = str(body.get("resolution_name") or body.get("resolution") or "").strip() or None
         preset = str(body.get("preset") or "").strip() or None
 
-        images = body.get("images") or []
-        if isinstance(images, str):
+        images = (
+            body.get("images")
+            or body.get("image_urls")
+            or body.get("input_references")
+            or body.get("input_reference")
+            or []
+        )
+        if isinstance(images, (str, dict)):
             images = [images]
         if images:
             if not isinstance(images, list):
-                raise ValidationError("images must be a list of image URLs or data URLs", param="images")
-            references_payload = [
-                {"image_url": str(item).strip()}
-                for item in images[:7]
-                if str(item).strip()
-            ] or None
+                raise ValidationError(
+                    "images must be a list of image URLs or data URLs",
+                    param="images",
+                )
+            references_payload = []
+            for item in images[:7]:
+                image_url = ""
+                if isinstance(item, dict):
+                    image_url = str(
+                        item.get("image_url")
+                        or item.get("url")
+                        or item.get("dataUrl")
+                        or item.get("data_url")
+                        or ""
+                    ).strip()
+                else:
+                    image_url = str(item).strip()
+                if image_url:
+                    references_payload.append({"image_url": image_url})
+            references_payload = references_payload or None
     else:
         form = await request.form()
         model = str(form.get("model") or "").strip() or None
         prompt = str(form.get("prompt") or "").strip() or None
         seconds = form.get("seconds") or form.get("duration") or 6
         size = str(form.get("size") or "720x1280").strip() or "720x1280"
+        aspect_ratio = str(form.get("aspect_ratio") or form.get("aspectRatio") or "").strip() or None
         resolution_name = str(form.get("resolution_name") or form.get("resolution") or "").strip() or None
         preset = str(form.get("preset") or "").strip() or None
 
@@ -521,7 +630,12 @@ async def videos_create(request: Request):
                 for f in uploads[:7]
             ]
         else:
-            images = form.getlist("images") or form.getlist("image")
+            images = (
+                form.getlist("images")
+                or form.getlist("image_urls")
+                or form.getlist("image")
+                or form.getlist("input_references")
+            )
             image_values = [str(item).strip() for item in images if str(item).strip()]
             if image_values:
                 references_payload = [
@@ -533,6 +647,14 @@ async def videos_create(request: Request):
         raise ValidationError("model is required", param="model")
     if not prompt:
         raise ValidationError("prompt is required", param="prompt")
+    model, prompt, size, resolution_name, seconds = _normalize_grok_video_alias_request(
+        model,
+        prompt,
+        size,
+        resolution_name,
+        seconds,
+        aspect_ratio,
+    )
 
     result = await create_video(
         model=model or "grok-video",

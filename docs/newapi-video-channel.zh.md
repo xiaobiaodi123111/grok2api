@@ -31,58 +31,90 @@
 
 ## 3. 视频模型与映射
 
-建议在 New API 里只添加这四个视频模型：
+建议在 New API 里只展示这四个视频模型，不再用模型名区分横竖屏：
 
-| New API 展示模型 | 映射到 grok2api 上游模型 | 推荐尺寸 |
-| :-- | :-- | :-- |
-| `grok-imagine-1.1-video-landscape-10s` | `grok-imagine-video` | `1280x720` |
-| `grok-imagine-1.1-video-portrait-10s` | `grok-imagine-video` | `720x1280` |
-| `grok-imagine-0.8-video-landscape-6s` | `grok-imagine-video` | `1280x720` |
-| `grok-imagine-0.8-video-portrait-6s` | `grok-imagine-video` | `720x1280` |
+| New API 展示模型 | 映射到 grok2api 上游模型 | 清晰度 | 时长 |
+| :-- | :-- | :-- | :-- |
+| `grok-imagine-0.8-video-6s` | `grok-imagine-video` | `480p` | `6s` |
+| `grok-imagine-0.8-video-10s` | `grok-imagine-video` | `480p` | `10s` |
+| `grok-imagine-1.0-video-6s` | `grok-imagine-video` | `720p` | `6s` |
+| `grok-imagine-1.0-video-10s` | `grok-imagine-video` | `720p` | `10s` |
 
-比例说明：
+比例由请求参数决定：
 
-| size | 比例 | 场景 |
+| size | aspect_ratio | 场景 |
 | :-- | :-- | :-- |
 | `1280x720` | `16:9` | 横屏视频 |
 | `720x1280` | `9:16` | 竖屏视频 |
 
-模型名只负责在 New API 里区分价格、时长和横竖屏；真正转发到 grok2api 时统一映射为 `grok-imagine-video`。
+模型名只负责区分清晰度和时长；真正转发到 grok2api 时统一映射为 `grok-imagine-video`。
 
-## 4. JSON 请求示例
+grok2api 会对这些别名做兜底归一化：
 
-横屏 10 秒：
+- `0.8` 固定写入 `resolution=480p` 和 `resolution_name=480p`
+- `1.0` 固定写入 `resolution=720p` 和 `resolution_name=720p`
+- `6s/10s` 固定写入 `seconds` 和 `duration`
+- `aspect_ratio=16:9` 会写入 `size=1280x720`
+- `aspect_ratio=9:16` 会写入 `size=720x1280`
+- 旧的 `landscape/portrait` 别名仍可兼容，但不建议继续展示
+
+## 4. New API 渠道配置要点
+
+渠道模型列表填写：
+
+```text
+grok-imagine-0.8-video-6s,grok-imagine-0.8-video-10s,grok-imagine-1.0-video-6s,grok-imagine-1.0-video-10s
+```
+
+模型映射填写：
+
+```json
+{
+  "grok-imagine-0.8-video-6s": "grok-imagine-video",
+  "grok-imagine-0.8-video-10s": "grok-imagine-video",
+  "grok-imagine-1.0-video-6s": "grok-imagine-video",
+  "grok-imagine-1.0-video-10s": "grok-imagine-video"
+}
+```
+
+如果 New API 开启了模型价格过滤，需要给这四个模型配置固定价格或倍率，否则 `/v1/models` 可能不会展示它们。
+
+## 5. JSON 请求示例
+
+横屏 720p 10 秒：
 
 ```bash
 curl https://grokapi.example.com/v1/videos \
   -H "Authorization: Bearer YOUR_GROK2API_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "grok-imagine-video",
-    "prompt": "A clean product showcase video, steady camera, no text, no watermark.",
+    "model": "grok-imagine-1.0-video-10s",
+    "prompt": "A clean product showcase video, steady camera, no text, no watermark. 视频比例：16:9 横屏。",
     "duration": 10,
-    "size": "1280x720"
+    "size": "1280x720",
+    "aspect_ratio": "16:9"
   }'
 ```
 
-竖屏 6 秒，带参考图：
+竖屏 480p 6 秒，带参考图：
 
 ```bash
 curl https://grokapi.example.com/v1/videos \
   -H "Authorization: Bearer YOUR_GROK2API_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "grok-imagine-video",
-    "prompt": "Generate a vertical fashion product video based on the reference image.",
+    "model": "grok-imagine-0.8-video-6s",
+    "prompt": "Generate a vertical fashion product video based on the reference image. 视频比例：9:16 竖屏。",
     "duration": 6,
     "size": "720x1280",
+    "aspect_ratio": "9:16",
     "images": ["https://example.com/reference.jpg"]
   }'
 ```
 
-`duration` 会被 grok2api 映射为 `seconds`。`images` 支持图片 URL、base64 或 data URL，并会作为参考图传入视频生成流程。
+`images` 支持图片 URL、base64 或 data URL。兼容字段包括 `images`、`image_urls`、`input_reference`、`input_references`。
 
-## 5. 查询任务与下载视频
+## 6. 查询任务与下载视频
 
 提交成功后会得到任务 ID：
 
@@ -131,7 +163,7 @@ curl https://grokapi.example.com/v1/videos/task_xxx \
 curl -L "https://grokapi.example.com/v1/files/video?id=xxxx" -o output.mp4
 ```
 
-## 6. 常见问题
+## 7. 常见问题
 
 ### 请求到了 grok2api，但返回 `Field required: model/prompt`
 
@@ -139,19 +171,21 @@ curl -L "https://grokapi.example.com/v1/files/video?id=xxxx" -o output.mp4
 
 ### 竖屏提示词生成了横屏视频
 
-检查 New API 选择的模型和 `size` 是否一致：
+检查请求里的 `size` 或 `aspect_ratio`：
 
-- 横屏模型使用 `1280x720`
-- 竖屏模型使用 `720x1280`
+- 横屏使用 `size=1280x720` 或 `aspect_ratio=16:9`
+- 竖屏使用 `size=720x1280` 或 `aspect_ratio=9:16`
 
-提示词里写“竖屏 9:16”不能替代 `size` 参数；最终比例由 `size` 映射出的 `aspectRatio` 决定。
+提示词里写“竖屏 9:16”不能替代 `size/aspect_ratio` 参数；最终比例由请求参数决定。
 
-### New API 没有请求到 grok2api
+### New API 用户侧看不到新模型
 
 重点检查：
 
 - 模型是否存在于 New API 渠道模型列表
 - 模型是否映射到 `grok-imagine-video`
+- `abilities` 是否已经同步到新模型
+- 模型是否配置了固定价格或倍率
 - 渠道是否启用且分组可用
 - Base URL 是否能从 New API 容器访问
 - API Key 是否和 grok2api 的 `app.api_key` 一致
